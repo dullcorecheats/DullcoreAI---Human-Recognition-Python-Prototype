@@ -1,0 +1,5 @@
+pip install numpy
+pip install mss
+pip install mediapipe
+pip install PyQt5
+maybe more idgas
