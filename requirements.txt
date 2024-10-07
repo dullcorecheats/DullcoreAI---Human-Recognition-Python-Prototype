@@ -1,5 +1,6 @@
-pip install numpy
+pip install opencv-python-headless
 pip install mss
-pip install mediapipe
+pip install pyautogui
+pip install keyboard
 pip install PyQt5
-maybe more idgas
+pip install ultralytics
