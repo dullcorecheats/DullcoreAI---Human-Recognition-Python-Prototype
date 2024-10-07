@@ -2,168 +2,172 @@ import sys
 import cv2
 import numpy as np
 import mss
-import mediapipe as mp
-from PyQt5.QtWidgets import QApplication, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QComboBox
-from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen
-from PyQt5.QtCore import Qt, QTimer
+import pyautogui
+import keyboard  # For detecting keypress events
+from tkinter import Tk, Label, Button, StringVar, Entry
+from ultralytics import YOLO
+from PyQt5 import QtWidgets, QtCore, QtGui
+import threading
 
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-
-monitor = {"top": 0, "left": 0, "width": 1920, "height": 1080} 
-sct = mss.mss()
-
-class SettingsDialog(QDialog):
-    def __init__(self, overlay):
+class TransparentOverlay(QtWidgets.QMainWindow):
+    def __init__(self, model, keys_config):
         super().__init__()
-        self.overlay = overlay
-        self.setWindowTitle("Settings")
+        self.model = model
 
-        layout = QVBoxLayout()
-
-        conf_label = QLabel("Detection Confidence")
-        layout.addWidget(conf_label)
-        self.conf_slider = QSlider(Qt.Horizontal)
-        self.conf_slider.setMinimum(0)
-        self.conf_slider.setMaximum(100)
-        self.conf_slider.setValue(int(self.overlay.detection_confidence * 100))
-        self.conf_slider.setTickPosition(QSlider.TicksBelow)
-        self.conf_slider.setTickInterval(10)
-        layout.addWidget(self.conf_slider)
-
-        line_thickness_label = QLabel("Line Thickness")
-        layout.addWidget(line_thickness_label)
-        self.line_thickness_slider = QSlider(Qt.Horizontal)
-        self.line_thickness_slider.setMinimum(1)
-        self.line_thickness_slider.setMaximum(10)
-        self.line_thickness_slider.setValue(self.overlay.line_thickness)
-        layout.addWidget(self.line_thickness_slider)
-
-        lod_label = QLabel("Level of Detail")
-        layout.addWidget(lod_label)
-        self.lod_combo = QComboBox()
-        self.lod_combo.addItem("Low (Bounding Box Only)")
-        self.lod_combo.addItem("Medium (Partial Skeleton)")
-        self.lod_combo.addItem("High (Full Skeleton)")
-        self.lod_combo.setCurrentIndex(self.overlay.level_of_detail)  
-        layout.addWidget(self.lod_combo)
-
-        self.apply_button = QPushButton("Apply")
-        self.apply_button.clicked.connect(self.apply_settings)
-        layout.addWidget(self.apply_button)
-
-        self.setLayout(layout)
-
-    def apply_settings(self):
-        self.overlay.detection_confidence = self.conf_slider.value() / 100
-        self.overlay.line_thickness = self.line_thickness_slider.value()
-        self.overlay.level_of_detail = self.lod_combo.currentIndex()  
-        self.overlay.update_pose_object()
-        self.accept()
-
-class Overlay(QLabel):
-    def __init__(self):
-        super().__init__()
-
-        self.detection_confidence = 0.6
-        self.line_thickness = 2
-        self.level_of_detail = 2  
-
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_NoSystemBackground)
-
-        self.setGeometry(0, 0, monitor["width"], monitor["height"])
-
-        self.timer = QTimer()
+        # Set up transparent window
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint | QtCore.Qt.X11BypassWindowManagerHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        
+        self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_overlay)
-        self.timer.start(30) 
+        self.timer.start(30)  # Refresh every 30ms
 
-        self.pose = mp_pose.Pose(min_detection_confidence=self.detection_confidence, min_tracking_confidence=0.6)
+        screen_resolution = QtWidgets.QDesktopWidget().screenGeometry()
+        self.setGeometry(0, 0, screen_resolution.width(), screen_resolution.height())
 
-        self.open_settings_menu()
+        # Initialize screen capture with mss
+        self.sct = mss.mss()
 
-    def update_pose_object(self):
-        self.pose = mp_pose.Pose(min_detection_confidence=self.detection_confidence, min_tracking_confidence=0.6)
+        # Initialize an empty list for bounding boxes
+        self.bounding_boxes = []
 
-    def open_settings_menu(self):
-        dialog = SettingsDialog(self)
-        dialog.exec_()
+        # State for snapping
+        self.snap_body = False
+        self.snap_head = False
+
+        # Key bindings
+        self.keys_config = keys_config  # {'snap_body': 'e', 'snap_head': 'r'}
+
+        # Add event listeners for key press (handled via the PyQt5 timer)
+        self.timer.timeout.connect(self.check_keypress)
 
     def update_overlay(self):
-        img = np.array(sct.grab(monitor))
-        frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        # Capture screen using mss
+        monitor = self.sct.monitors[1]  # Get the primary monitor
+        screen = np.array(self.sct.grab(monitor))
 
-        results = self.pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        # Convert the BGRA (from mss) to RGB
+        screen = cv2.cvtColor(screen, cv2.COLOR_BGRA2RGB)
 
-        overlay_image = QImage(self.width(), self.height(), QImage.Format_ARGB32)
-        overlay_image.fill(Qt.transparent)
+        # YOLO human detection
+        results = self.model(screen)
+        
+        # Clear and prepare for painting bounding boxes
+        self.bounding_boxes = []
+        
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                cls = box.cls
+                if cls == 0:  # Class 0 is for humans in YOLO
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])  # Full-body bounding box
 
-        if results.pose_landmarks:
-            height, width, _ = frame.shape
+                    # Add full-body bounding box to list
+                    self.bounding_boxes.append((x1, y1, x2, y2, 'body'))
 
+                    # Estimate head region
+                    body_height = y2 - y1
+                    body_width = x2 - x1
 
-            painter = QPainter(overlay_image)
+                    # Approximate head height as 1/8 of the body height
+                    head_height = int(body_height * 0.125)
 
+                    # Approximate head width as 1/4 of the body width
+                    head_width = int(body_width * 0.25)
 
-            self.draw_bounding_box(painter, results.pose_landmarks, width, height)
+                    # Calculate the head's top-left and bottom-right coordinates
+                    head_x1 = x1 + (body_width // 2) - (head_width // 2)
+                    head_x2 = head_x1 + head_width
+                    head_y2 = y1 + head_height
 
-            if self.level_of_detail == 2:  
-                self.draw_skeleton(painter, results.pose_landmarks, width, height)
-            elif self.level_of_detail == 1:  
-                self.draw_partial_skeleton(painter, results.pose_landmarks, width, height)
+                    # Add head bounding box to list
+                    self.bounding_boxes.append((head_x1, y1, head_x2, head_y2, 'head'))
 
-            painter.end()
+                    # Handle snapping
+                    if self.snap_body:
+                        body_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                        self.move_mouse(body_center)
+                        self.snap_body = False  # Snap only once per detection
 
-        self.setPixmap(QPixmap.fromImage(overlay_image))
+                    if self.snap_head:
+                        head_center = ((head_x1 + head_x2) // 2, (y1 + head_y2) // 2)
+                        self.move_mouse(head_center)
+                        self.snap_head = False  # Snap only once per detection
 
-    def draw_skeleton(self, painter, pose_landmarks, width, height):
-        """Draw the full pose skeleton using QPainter."""
-        for connection in mp_pose.POSE_CONNECTIONS:
-            start_idx, end_idx = connection
-            start_landmark = pose_landmarks.landmark[start_idx]
-            end_landmark = pose_landmarks.landmark[end_idx]
+        # Trigger the paint event to draw bounding boxes
+        self.repaint()
 
-            start_point = (int(start_landmark.x * width), int(start_landmark.y * height))
-            end_point = (int(end_landmark.x * width), int(end_landmark.y * height))
+    def move_mouse(self, position):
+        # Move mouse to the specified (x, y) position
+        pyautogui.moveTo(position[0], position[1])
 
-            painter.setPen(QPen(QColor(0, 255, 0), self.line_thickness, Qt.SolidLine))  
-            painter.drawLine(start_point[0], start_point[1], end_point[0], end_point[1])
+    def check_keypress(self):
+        # Check for keypress based on current configuration
+        if keyboard.is_pressed(self.keys_config['snap_body']):
+            self.snap_body = True
+        if keyboard.is_pressed(self.keys_config['snap_head']):
+            self.snap_head = True
 
-    def draw_partial_skeleton(self, painter, pose_landmarks, width, height):
-        """Draw a partial pose skeleton (e.g., only the torso and limbs)."""
-        partial_connections = [
-            (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.RIGHT_SHOULDER),
-            (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_ELBOW),
-            (mp_pose.PoseLandmark.RIGHT_SHOULDER, mp_pose.PoseLandmark.RIGHT_ELBOW),
-            (mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.RIGHT_HIP),
-            (mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.LEFT_KNEE),
-            (mp_pose.PoseLandmark.RIGHT_HIP, mp_pose.PoseLandmark.RIGHT_KNEE)
-        ]
-        for start_idx, end_idx in partial_connections:
-            start_landmark = pose_landmarks.landmark[start_idx]
-            end_landmark = pose_landmarks.landmark[end_idx]
+    def draw_bounding_box(self, painter, x1, y1, x2, y2, label):
+        # Set different colors for head and body boxes
+        if label == 'body':
+            color = QtCore.Qt.red  # Red for body
+        else:
+            color = QtCore.Qt.blue  # Blue for head
+        
+        painter.setPen(QtGui.QPen(color, 3))
+        painter.drawRect(x1, y1, x2 - x1, y2 - y1)
 
-            # Scale landmarks to screen size
-            start_point = (int(start_landmark.x * width), int(start_landmark.y * height))
-            end_point = (int(end_landmark.x * width), int(end_landmark.y * height))
+    def paintEvent(self, event):
+        # Draw bounding boxes on the transparent overlay
+        painter = QtGui.QPainter(self)
+        for (x1, y1, x2, y2, label) in self.bounding_boxes:
+            self.draw_bounding_box(painter, x1, y1, x2, y2, label)
 
-            painter.setPen(QPen(QColor(0, 255, 0), self.line_thickness, Qt.SolidLine))  
-            painter.drawLine(start_point[0], start_point[1], end_point[0], end_point[1])
+class SettingsWindow(Tk):
+    def __init__(self, keys_config):
+        super().__init__()
+        self.keys_config = keys_config
+        self.title("Settings")
+        self.geometry("300x200")
 
-    def draw_bounding_box(self, painter, pose_landmarks, width, height):
-        """Draws a bounding box around the detected pose."""
-        landmarks = pose_landmarks.landmark
-        x_min = min(int(landmark.x * width) for landmark in landmarks)
-        x_max = max(int(landmark.x * width) for landmark in landmarks)
-        y_min = min(int(landmark.y * height) for landmark in landmarks)
-        y_max = max(int(landmark.y * height) for landmark in landmarks)
+        # Label and entry for snapping to body key
+        Label(self, text="Snap to Body Key:").pack(pady=5)
+        self.body_key_entry = StringVar(value=self.keys_config['snap_body'])
+        Entry(self, textvariable=self.body_key_entry).pack(pady=5)
 
-        painter.setPen(QPen(QColor(255, 0, 0), self.line_thickness, Qt.SolidLine))  
-        painter.drawRect(x_min, y_min, x_max - x_min, y_max - y_min)
+        # Label and entry for snapping to head key
+        Label(self, text="Snap to Head Key:").pack(pady=5)
+        self.head_key_entry = StringVar(value=self.keys_config['snap_head'])
+        Entry(self, textvariable=self.head_key_entry).pack(pady=5)
+
+        # Save button
+        Button(self, text="Save", command=self.save_keys).pack(pady=20)
+
+    def save_keys(self):
+        self.keys_config['snap_body'] = self.body_key_entry.get()
+        self.keys_config['snap_head'] = self.head_key_entry.get()
+        print(f"Updated Key Bindings: {self.keys_config}")
+        self.destroy()  # Close the settings window
+
+def run_overlay(model, keys_config):
+    # Start the overlay in a separate thread
+    app = QtWidgets.QApplication(sys.argv)
+    overlay = TransparentOverlay(model, keys_config)
+    overlay.showFullScreen()
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    overlay = Overlay()
-    overlay.show()
-    sys.exit(app.exec_())
+    # Load YOLOv8 model
+    model = YOLO('yolov8n.pt')  # Use YOLOv8 model with pretrained weights
+
+    # Create keys configuration
+    keys_config = {'snap_body': 'e', 'snap_head': 'r'}  # Default keys
+
+    # Create and run settings window
+    settings_window = SettingsWindow(keys_config)
+    settings_window.mainloop()
+
+    # Run overlay after settings window is closed
+    run_overlay(model, keys_config)
